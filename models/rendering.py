@@ -1,5 +1,4 @@
 import torch
-from torchsearchsorted import searchsorted
 
 __all__ = ['render_rays']
 
@@ -10,13 +9,6 @@ Function dependencies: (-> means function calls)
 
 @render_rays -> @sample_pdf if there is fine model
 """
-
-def normalize(tensor):
-    """
-    tensor: (B, 3)
-    """
-    norm = torch.norm(tensor, dim=1, keepdim=True)
-    return tensor / (norm+1e-6)
 
 
 def sample_pdf(bins, weights, N_importance, det=False, eps=1e-5):
@@ -47,7 +39,7 @@ def sample_pdf(bins, weights, N_importance, det=False, eps=1e-5):
         u = torch.rand(N_rays, N_importance, device=bins.device)
     u = u.contiguous()
 
-    inds = searchsorted(cdf, u, side='right')
+    inds = torch.searchsorted(cdf, u, right=True)
     below = torch.clamp_min(inds-1, 0)
     above = torch.clamp_max(inds, N_samples_)
 
@@ -73,7 +65,8 @@ def render_rays(models,
                 N_importance=0,
                 chunk=1024*32,
                 white_back=False,
-                test_time=False
+                test_time=False,
+                **kwargs
                 ):
     """
     Render rays by computing the output of @model applied on @rays
@@ -96,7 +89,7 @@ def render_rays(models,
         result: dictionary containing final rgb and depth maps for coarse and fine models
     """
 
-    def inference(results, model, typ, xyz_, dir_, dir_embedded, z_vals, test_time=False):
+    def inference(results, model, typ, xyz_, dir_, dir_embedded, z_vals, test_time=False, **kwargs):
         """
         Helper function that performs model inference.
 
@@ -138,9 +131,9 @@ def render_rays(models,
                 out_chunks += [model(xyzdir_embedded, sigma_only=False)]
 
             out = torch.cat(out_chunks, 0)
-            rgbsigma = out.view(N_rays, N_samples_, 4)
-            rgbs = rgbsigma[..., :3] # (N_rays, N_samples_, 3)
-            sigmas = rgbsigma[..., 3] # (N_rays, N_samples_)
+            out = out.view(N_rays, N_samples_, 4)
+            rgbs = out[..., :3] # (N_rays, N_samples_, 3)
+            sigmas = out[..., 3] # (N_rays, N_samples_)
         else:
             for i in range(0, B, chunk):
                 xyz_embedded = embedding_xyz(xyz_[i:i+chunk])
@@ -149,61 +142,14 @@ def render_rays(models,
             out = torch.cat(out_chunks, 0)
             sigmas = out.view(N_rays, N_samples_)
 
-        if typ == 'fine':
-            if not test_time:  # regularize normals in fine model
-                subsample_idx = torch.randint(B, (N_rays,), device=xyz_.device)
-                xyz_subsampled = xyz_[subsample_idx] # (N_rays, 3)
-                neighbor_dist = 1e-4
-                xyz_subsampled_neighbors = xyz_subsampled + \
-                                torch.rand_like(xyz_subsampled)*neighbor_dist - neighbor_dist/2
-
-                normals_ndc_chunks = []
-                normals_ndc_neighbors_chunks = []
-                for i in range(0, N_rays, chunk):
-                    # Compute normals using finite difference
-                    normals_ndc_chunk = []
-                    for j in range(3):
-                        eps = torch.zeros(3, device=xyz_.device)
-                        eps[j] = 1e-6
-                        xyz_embedded_m = embedding_xyz(xyz_subsampled[i:i+chunk]-eps)
-                        xyz_embedded_p = embedding_xyz(xyz_subsampled[i:i+chunk]+eps)
-                        df_dxj = model(xyz_embedded_m, sigma_only=True) - \
-                                 model(xyz_embedded_p, sigma_only=True)
-                        normals_ndc_chunk += [df_dxj] # (chunk, 1)
-                    normals_ndc_chunks += [torch.cat(normals_ndc_chunk, 1)] # (chunk, 3)
-
-                    normals_ndc_neighbors_chunk = []
-                    for j in range(3):
-                        eps = torch.zeros(3, device=xyz_.device)
-                        eps[j] = 1e-6
-                        xyz_embedded_m = embedding_xyz(xyz_subsampled_neighbors[i:i+chunk]-eps)
-                        xyz_embedded_p = embedding_xyz(xyz_subsampled_neighbors[i:i+chunk]+eps)
-                        df_dxj = model(xyz_embedded_m, sigma_only=True) - \
-                                 model(xyz_embedded_p, sigma_only=True)
-                        normals_ndc_neighbors_chunk += [df_dxj] # (chunk, 1)
-                    normals_ndc_neighbors_chunks += [torch.cat(normals_ndc_neighbors_chunk, 1)] # (chunk, 3)
-
-                normals_ndc = torch.cat(normals_ndc_chunks, 0) # (N_rays, 3)
-                normals_ndc = normalize(normals_ndc)
-                normals_ndc_neighbors = torch.cat(normals_ndc_neighbors_chunks, 0) # (N_rays, 3)
-                normals_ndc_neighbors = normalize(normals_ndc_neighbors)
-
-            else:
-                normals_ndc_chunks = []
-                for i in range(0, B, chunk):
-                    # Compute normals using finite difference
-                    normals_ndc_chunk = []
-                    for j in range(3):
-                        eps = torch.zeros(3, device=xyz_.device)
-                        eps[j] = 1e-6
-                        xyz_embedded_m = embedding_xyz(xyz_[i:i+chunk]-eps)
-                        xyz_embedded_p = embedding_xyz(xyz_[i:i+chunk]+eps)
-                        df_dxj = model(xyz_embedded_m, sigma_only=True) - \
-                                 model(xyz_embedded_p, sigma_only=True)
-                        normals_ndc_chunk += [df_dxj] # (chunk, 1)
-                    normals_ndc_chunks += [torch.cat(normals_ndc_chunk, 1)] # (chunk, 3)
-                normals_ndc = torch.cat(normals_ndc_chunks, 0) # (N_rays*N_samples_, 3)
-                normals_ndc = normalize(normals_ndc)
+        xyz_ = xyz_.view(N_rays, N_samples_, 3)
+        if 'bboxes_del' in kwargs and test_time:
+            for bbox in kwargs['bboxes_del']:
+                xmin, xmax, ymin, ymax, zmin, zmax = bbox
+                inside_bbox = (xyz_[..., 0] > xmin) & (xyz_[..., 0] < xmax) & \
+                              (xyz_[..., 1] > ymin) & (xyz_[..., 1] < ymax) & \
+                              (xyz_[..., 2] > zmin) & (xyz_[..., 2] < zmax)
+                sigmas[inside_bbox] = -1e6 # make it transparent
 
         # Convert these values using volume rendering (Section 4)
         deltas = z_vals[:, 1:] - z_vals[:, :-1] # (N_rays, N_samples_-1)
@@ -226,26 +172,19 @@ def render_rays(models,
                                      # equals "1 - (1-a1)(1-a2)...(1-an)" mathematically
 
         results[f'weights_{typ}'] = weights
+        results[f'opacity_{typ}'] = weights_sum
         if test_time and typ == 'coarse':
             return
 
-        # compute final weighted outputs
-        rgb_map = torch.sum(weights.unsqueeze(-1)*rgbs, -2) # (N_rays, 3)
-        depth_map = torch.sum(weights*z_vals, -1) # (N_rays)
+        rgb_map = torch.sum(weights.unsqueeze(-1)*rgbs, 1) # (N_rays, 3)
+        # depth_map = torch.sum(weights*z_vals, -1) # (N_rays)
+        depth_map = torch.sum(weights.unsqueeze(-1)*xyz_, 1) # (N_rays, 3)
 
         if white_back:
             rgb_map = rgb_map + 1-weights_sum.unsqueeze(-1)
 
         results[f'rgb_{typ}'] = rgb_map
         results[f'depth_{typ}'] = depth_map
-        if typ == 'fine':
-            if not test_time:
-                results['normals_ndc_fine'] = normals_ndc
-                results['normals_ndc_neighbors_fine'] = normals_ndc_neighbors
-            else:
-                normals_ndc = normals_ndc.view(N_rays, N_samples_, 3)
-                normal_map = torch.sum(weights.unsqueeze(-1)*normals_ndc, -2) # (N_rays, 3)
-                results['normal_map_fine'] = normalize(normal_map)
 
         return
 
@@ -260,7 +199,10 @@ def render_rays(models,
     near, far = rays[:, 6:7], rays[:, 7:8] # both (N_rays, 1)
 
     # Embed direction
-    dir_embedded = embedding_dir(rays_d) # (N_rays, embed_dir_channels)
+    if 'view_dir' in kwargs:
+        dir_embedded = embedding_dir(kwargs['view_dir'])
+    else:
+        dir_embedded = embedding_dir(rays_d) # (N_rays, embed_dir_channels)
 
     # Sample depth points
     z_steps = torch.linspace(0, 1, N_samples, device=rays.device) # (N_samples)
@@ -285,7 +227,7 @@ def render_rays(models,
 
     results = {}
     inference(results, model_coarse, 'coarse', xyz_coarse_sampled, rays_d,
-              dir_embedded, z_vals, test_time)
+              dir_embedded, z_vals, test_time, **kwargs)
 
     if N_importance > 0: # sample points for fine model
         z_vals_mid = 0.5 * (z_vals[: ,:-1] + z_vals[: ,1:]) # (N_rays, N_samples-1) interval mid points
@@ -302,6 +244,6 @@ def render_rays(models,
 
         model_fine = models[1]
         inference(results, model_fine, 'fine', xyz_fine_sampled, rays_d,
-                  dir_embedded, z_vals, test_time)
+                  dir_embedded, z_vals, test_time, **kwargs)
 
     return results
