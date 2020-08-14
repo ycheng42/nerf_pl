@@ -101,6 +101,7 @@ def render_rays(models,
                   N_samples_ is the number of sampled points in each ray;
                              = N_samples for coarse model
                              = N_samples+N_importance for fine model
+                             +1 if add new objects in kwargs
             dir_: (N_rays, 3) ray directions
             dir_embedded: (N_rays, embed_dir_channels) embedded directions
             z_vals: (N_rays, N_samples_) depths of the sampled positions
@@ -115,7 +116,6 @@ def render_rays(models,
                 weights: (N_rays, N_samples_): weights of each sample
         """
         N_samples_ = xyz_.shape[1]
-        # Embed directions
         xyz_ = xyz_.view(-1, 3) # (N_rays*N_samples_, 3)
 
         # Perform model inference to get rgb and raw sigma
@@ -164,8 +164,16 @@ def render_rays(models,
 
         # compute alpha by the formula (3)
         alphas = 1-torch.exp(-deltas*torch.relu(sigmas+noise)) # (N_rays, N_samples_)
+        if 'rays_inter' in kwargs and typ == 'fine' and test_time:
+            idx_inter = torch.searchsorted(z_vals, kwargs['rays_inter']) # (N_rays, 1)
+            all_idxs = torch.arange(N_samples_, device=sigmas.device).expand(N_rays, -1) # (N_rays, N_samples_)
+            hit_map = all_idxs==idx_inter
+            hit_map[:, -1] = False # ignore rays without intersection (intersection at infinity)
+            alphas[hit_map] = 1.0 # opaque at this intersection
+            rgbs[hit_map] = 0.0 # color of the object (TODO: change to object color!)
+            
         alphas_shifted = \
-            torch.cat([torch.ones_like(alphas[:, :1]), 1-alphas+1e-10], -1) # [1, a1, a2, ...]
+            torch.cat([torch.ones_like(alphas[:, :1]), 1-alphas+1e-10], -1) # [1, 1-a1, 1-a2, ...]
         weights = \
             alphas * torch.cumprod(alphas_shifted, -1)[:, :-1] # (N_rays, N_samples_)
         weights_sum = weights.sum(1) # (N_rays), the accumulated opacity along the rays
@@ -177,14 +185,15 @@ def render_rays(models,
             return
 
         rgb_map = torch.sum(weights.unsqueeze(-1)*rgbs, 1) # (N_rays, 3)
-        # depth_map = torch.sum(weights*z_vals, -1) # (N_rays)
-        depth_map = torch.sum(weights.unsqueeze(-1)*xyz_, 1) # (N_rays, 3)
+        depth_map = torch.sum(weights*z_vals, -1) # (N_rays)
+        # depth_map = torch.sum(weights.unsqueeze(-1)*xyz_, 1) # (N_rays, 3)
 
         if white_back:
             rgb_map = rgb_map + 1-weights_sum.unsqueeze(-1)
 
         results[f'rgb_{typ}'] = rgb_map
         results[f'depth_{typ}'] = depth_map
+        results[f'z_vals_{typ}'] = z_vals
 
         return
 
@@ -235,8 +244,12 @@ def render_rays(models,
                              N_importance, det=(perturb==0))
                   # detach so that grad doesn't propogate to weights_coarse from here
 
-        z_vals, _ = torch.sort(torch.cat([z_vals, z_vals_], -1), -1)
-                    # values are interleaved actually, so maybe can do better than sort?
+        z_vals_list = [z_vals, z_vals_]
+
+        if 'rays_inter' in kwargs and test_time:
+            z_vals_list.append(kwargs['rays_inter'])
+
+        z_vals, _ = torch.sort(torch.cat(z_vals_list, -1), -1)
 
         xyz_fine_sampled = rays_o.unsqueeze(1) + \
                            rays_d.unsqueeze(1) * z_vals.unsqueeze(2)
